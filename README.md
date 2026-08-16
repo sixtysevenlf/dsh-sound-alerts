@@ -8,8 +8,8 @@ DSH Web UI 声音提示插件（browser client bundle，`platform: web`）。
 | --- | --- | --- |
 | 需要授权（沙箱/命令审批） | 双音 ×2（急切） | 会话 `pendingInteraction === 'approval'`（`approval/requested` 帧） |
 | 需要回答问题（ask_user_question） | 单次双音（柔和） | 会话 `pendingInteraction` 为 `question` / `plan-review` |
-| 任务/运行完成 | 上行两音 | 会话 `running` true→false（2.5s 复检）或后台会话 `completed` 标记 |
-| goal 完成 | 胜利三连音 | 当前会话 goal 投影 phase → `complete` |
+| 任务/运行完成 | 三连胜利音 | 会话 `running` true→false（2.5s 复检）或后台会话 `completed` 标记 |
+| goal 完成 | 四音胜利收尾 | 当前会话 goal 投影 phase → `complete` |
 
 声音在浏览器标签页中播放（含后台标签页），首次点击/按键后解锁 AudioContext。
 

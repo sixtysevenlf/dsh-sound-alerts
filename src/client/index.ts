@@ -11,9 +11,9 @@
  *
  * 2. 任务 / 运行完成（"项目完成"）
  *    - 会话 running true→false（列表快照）或 turnEnds 增长（会话事件）：
- *      延迟 2.5s 复检（排队间隙不误报）后播"完成"音；
- *    - 后台会话出现 completed 标记（侧栏绿色"done"提醒）：播"完成"音；
- *    - 当前会话 goal 投影 phase → "complete"：播放胜利三连音。
+ *      延迟 2.5s 复检（排队间隙不误报）后播三连胜利音；
+ *    - 后台会话出现 completed 标记（侧栏绿色"done"提醒）：播三连胜利音；
+ *    - 当前会话 goal 投影 phase → "complete"：播放四音胜利收尾。
  *
  * 3. 设置
  *    - 设置 → 通用 面板有一行开关 + 音量滑杆（settings.general.item slot）；
@@ -165,10 +165,11 @@ const ATTENTION_QUESTION: Note[] = [
   { freq: 587, start: 0.24, dur: 0.34, type: 'triangle' },
 ]
 
-/** 任务完成：上行两音 */
+/** 任务/运行完成：三连胜利音（523→659→784） */
 const DONE: Note[] = [
-  { freq: 659, start: 0, dur: 0.18 },
-  { freq: 880, start: 0.2, dur: 0.4 },
+  { freq: 523, start: 0, dur: 0.16 },
+  { freq: 659, start: 0.18, dur: 0.16 },
+  { freq: 784, start: 0.36, dur: 0.3 },
 ]
 
 /** goal 完成：胜利三连音 + 高音收尾 */
@@ -323,14 +324,20 @@ export function apply(ctx: ClientCtx): void {
         const entry = snapshot.byId[id]
         if (entry === undefined) continue
 
-        // ① 需要授权 / 需要提问
+        // ① 需要授权 / 需要提问（pending 从无到有或类型变化 → 响；消失 → 清除记忆，
+        //    保证同一会话的第二次/下一次审批照样响）
         const pending = entry.pendingInteraction
-        if (pending !== undefined && seenInteraction.get(id) !== pending) {
-          seenInteraction.set(id, pending)
-          dbg('pendingInteraction', `${id}: ${pending}`)
-          if (settings.enabled && settings.approval) {
-            play(pending === 'approval' ? ATTENTION_APPROVAL : ATTENTION_QUESTION, settings.volume, `pending:${pending}`)
+        if (pending !== undefined) {
+          if (seenInteraction.get(id) !== pending) {
+            seenInteraction.set(id, pending)
+            dbg('pendingInteraction', `${id}: ${pending}`)
+            if (settings.enabled && settings.approval) {
+              play(pending === 'approval' ? ATTENTION_APPROVAL : ATTENTION_QUESTION, settings.volume, `pending:${pending}`)
+            }
           }
+        } else if (seenInteraction.has(id)) {
+          seenInteraction.delete(id)
+          dbg('pendingInteraction cleared', id)
         }
 
         // ② 后台会话完成（侧栏 "done" 标记）
