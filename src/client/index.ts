@@ -15,21 +15,44 @@
  *    - 后台会话出现 completed 标记（侧栏绿色"done"提醒）：播三连胜利音；
  *    - 当前会话 goal 投影 phase → "complete"：播放四音胜利收尾。
  *
- * 3. 设置
- *    - 设置 → 通用 面板有一行开关 + 音量滑杆（settings.general.item slot）；
- *    - 持久化于 localStorage（键 dsh-sound-alerts:settings）。
+ * 3. 任务失败
+ *    - 当前会话 lastAgentError 从 null → 字符串（host/agent-error 帧）：
+ *      播放关羽之歌（D 羽调五声音阶合成致敬版，悲壮进行曲）。
  *
- * 4. 诊断
+ * 4. 自定义声音
+ *    - 每个事件（授权/提问/完成/失败/goal）可上传自己的音频文件：
+ *      文件以 dataURL 存入 IndexedDB（不占 localStorage 配额），设置里只存元信息；
+ *      播放时优先用自定义音频，加载/播放失败自动回退内置合成音。
+ *    - 试听按钮：有自定义播自定义，无自定义播默认音。
+ *
+ * 5. 设置
+ *    - 设置 → 通用 面板：总开关 + 音量 + 各事件开关/上传/试听/清除
+ *      （settings.general.item slot）；持久化于 localStorage（dsh-sound-alerts:settings）。
+ *
+ * 6. 诊断
  *    - console.debug('[sound-alerts]', ...) + window.__soundAlertsLog 最近 100 条。
  *
  * 浏览器自动播放策略：AudioContext 懒创建，首次 pointerdown/keydown 手势解锁；
  * 后台标签页仍可出声（这正是提醒场景）。resume() 竞态已处理（异步恢复后补播）。
+ * 自定义音频走 <audio> 元素，页面有过用户激活即可后台播放。
  *
  * 构建：npm run build:client（esbuild → lib/client.js，ModuleLoader.load 注册）。
  */
-import { createElement, useState } from 'react'
+import { createElement, useRef, useState } from 'react'
 
 const SETTINGS_KEY = 'dsh-sound-alerts:settings'
+
+/** 可自定义声音的事件类型 */
+export type SoundEvent = 'approval' | 'question' | 'done' | 'error' | 'goal'
+
+/** 自定义声音元信息（音频本体存 IndexedDB；url 分支为将来粘贴链接预留） */
+export interface CustomSound {
+  source: 'file' | 'url'
+  /** 显示名（文件名或 URL） */
+  name: string
+  /** source === 'url' 时的音频地址 */
+  url?: string
+}
 
 export interface SoundSettings {
   /** 总开关 */
@@ -42,6 +65,10 @@ export interface SoundSettings {
   done: boolean
   /** goal 完成提示音 */
   goal: boolean
+  /** 任务失败提示音（关羽之歌） */
+  error: boolean
+  /** 各事件自定义声音（缺省 = 内置合成音） */
+  custom: Partial<Record<SoundEvent, CustomSound>>
 }
 
 const DEFAULT_SETTINGS: SoundSettings = {
@@ -50,6 +77,8 @@ const DEFAULT_SETTINGS: SoundSettings = {
   approval: true,
   done: true,
   goal: true,
+  error: true,
+  custom: {},
 }
 
 function loadSettings(): SoundSettings {
@@ -57,7 +86,7 @@ function loadSettings(): SoundSettings {
     const raw = window.localStorage.getItem(SETTINGS_KEY)
     if (raw !== null) {
       const parsed = JSON.parse(raw) as Partial<SoundSettings>
-      return { ...DEFAULT_SETTINGS, ...parsed }
+      return { ...DEFAULT_SETTINGS, ...parsed, custom: parsed.custom ?? {} }
     }
   } catch {
     /* fall through to defaults */
@@ -71,6 +100,53 @@ function saveSettings(settings: SoundSettings): void {
   } catch {
     /* storage unavailable — keep in-memory value */
   }
+}
+
+// ── IndexedDB：自定义音频本体（dataURL）──────────────────────────────────────
+
+const IDB_NAME = 'dsh-sound-alerts'
+const IDB_STORE = 'custom'
+const MAX_CUSTOM_BYTES = 10 * 1024 * 1024
+
+function idbOpen(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1)
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(IDB_STORE)) req.result.createObjectStore(IDB_STORE)
+    }
+    req.onsuccess = () => resolve(req.result)
+    req.onerror = () => reject(req.error)
+  })
+}
+
+async function idbSet(key: string, value: unknown): Promise<void> {
+  const db = await idbOpen()
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readwrite')
+    tx.objectStore(IDB_STORE).put(value, key)
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+    tx.onabort = () => reject(tx.error)
+  })
+}
+
+async function idbGet(key: string): Promise<unknown> {
+  const db = await idbOpen()
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(IDB_STORE, 'readonly').objectStore(IDB_STORE).get(key)
+    req.onsuccess = () => resolve(req.result)
+    req.onerror = () => reject(req.error)
+  })
+}
+
+async function idbDel(key: string): Promise<void> {
+  const db = await idbOpen()
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readwrite')
+    tx.objectStore(IDB_STORE).delete(key)
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+  })
 }
 
 // ── 诊断 ─────────────────────────────────────────────────────────────────────
@@ -180,10 +256,73 @@ const VICTORY: Note[] = [
   { freq: 1047, start: 0.56, dur: 0.5 },
 ]
 
+/**
+ * 任务失败：关羽之歌（致敬版）。
+ * D 羽调五声音阶 + 低音鼓的悲壮进行曲，合成自 Web Audio（无版权音频）。
+ * 结构：前奏鼓点 ×4 → 主题下行乐句 ×2（第二遍带长音收尾）→ 鼓点收束。
+ */
+const GUAN_YU: Note[] = [
+  // 前奏：四记战鼓
+  { freq: 73.4, start: 0, dur: 0.14, type: 'sine', gain: 1 },
+  { freq: 73.4, start: 0.36, dur: 0.14, type: 'sine', gain: 1 },
+  { freq: 73.4, start: 0.72, dur: 0.14, type: 'sine', gain: 1 },
+  { freq: 73.4, start: 1.08, dur: 0.16, type: 'sine', gain: 1.1 },
+  // 低音持续（悲壮底色）
+  { freq: 146.83, start: 1.4, dur: 3.5, type: 'sine', gain: 0.5 },
+  // 主题 A：D5 C5 A4 F5 E5 D5（号角式下行）
+  { freq: 587.33, start: 1.4, dur: 0.3, type: 'triangle', gain: 1 },
+  { freq: 523.25, start: 1.74, dur: 0.2, type: 'triangle', gain: 0.9 },
+  { freq: 440, start: 2.0, dur: 0.42, type: 'triangle', gain: 0.95 },
+  { freq: 698.46, start: 2.48, dur: 0.24, type: 'triangle', gain: 1 },
+  { freq: 659.25, start: 2.76, dur: 0.16, type: 'triangle', gain: 0.9 },
+  { freq: 587.33, start: 2.96, dur: 0.5, type: 'triangle', gain: 1 },
+  // 主题 B：A4 C5 D5 长音 + 收束
+  { freq: 440, start: 3.52, dur: 0.2, type: 'triangle', gain: 0.9 },
+  { freq: 523.25, start: 3.76, dur: 0.16, type: 'triangle', gain: 0.9 },
+  { freq: 587.33, start: 3.96, dur: 0.7, type: 'triangle', gain: 1.05 },
+  // 收束：低音鼓 + 根音长鸣
+  { freq: 73.4, start: 4.72, dur: 0.16, type: 'sine', gain: 1.1 },
+  { freq: 146.83, start: 4.72, dur: 0.9, type: 'sine', gain: 0.6 },
+]
+
+/** 各事件的内置回退音 */
+const FALLBACKS: Record<SoundEvent, Note[]> = {
+  approval: ATTENTION_APPROVAL,
+  question: ATTENTION_QUESTION,
+  done: DONE,
+  error: GUAN_YU,
+  goal: VICTORY,
+}
+
+// ── 播放入口（内置合成 + 自定义音频）──────────────────────────────────────────
+
 /** 全局防抖：1.2s 内最多一声，避免批量完成/多会话同时触发时轰炸 */
 let lastPlayAt = 0
 
-function play(notes: Note[], volume: number, reason: string): void {
+/** 播放自定义音频（dataURL 来自 IndexedDB；url 分支预留）。失败返回 false。 */
+async function playCustomAudio(event: SoundEvent, custom: CustomSound, volume: number): Promise<boolean> {
+  try {
+    let src: string | undefined
+    if (custom.source === 'url' && typeof custom.url === 'string' && custom.url.length > 0) {
+      src = custom.url
+    } else if (custom.source === 'file') {
+      const stored = await idbGet('custom:' + event) as { dataUrl?: string } | undefined
+      if (stored !== undefined && typeof stored.dataUrl === 'string') src = stored.dataUrl
+    }
+    if (src === undefined) return false
+    const audio = new Audio(src)
+    audio.volume = Math.min(1, Math.max(0, volume))
+    await audio.play()
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 事件播放统一入口：防抖 → 自定义音频优先 → 失败/缺省回退内置合成音。
+ */
+function playEvent(event: SoundEvent, volume: number, reason: string): void {
   const now = Date.now()
   if (now - lastPlayAt < 1200) {
     dbg('play throttled', reason)
@@ -191,7 +330,19 @@ function play(notes: Note[], volume: number, reason: string): void {
   }
   lastPlayAt = now
   dbg('play', reason)
-  playMelody(notes, volume)
+  const settings = loadSettings()
+  const custom = settings.custom?.[event]
+  if (custom !== undefined) {
+    void (async () => {
+      const ok = await playCustomAudio(event, custom, settings.volume)
+      if (!ok) {
+        dbg('custom audio failed, fallback to builtin', `${event}: ${custom.name}`)
+        playMelody(FALLBACKS[event], settings.volume)
+      }
+    })()
+  } else {
+    playMelody(FALLBACKS[event], settings.volume)
+  }
 }
 
 // ── 会话监视 ─────────────────────────────────────────────────────────────────
@@ -210,7 +361,7 @@ interface ListSnapshot {
 interface SessionLike {
   sessionId: string
   subscribe(fn: () => void): () => void
-  getSnapshot(): { turnEnds?: { size?: number } }
+  getSnapshot(): { turnEnds?: { size?: number }; lastAgentError?: string | null }
   projections?: { get(key: string): { goal?: { id?: string; phase?: string } } | undefined }
 }
 
@@ -265,6 +416,10 @@ export function apply(ctx: ClientCtx): void {
     let lastGoalId: string | undefined
     let lastGoalPhase: string | undefined
     let lastTurnEnds = 0
+    /** 最近观察到的 lastAgentError（快照引用/字符串），用于失败边缘检测 */
+    let lastError: string | null = null
+    /** 失败音时间窗：同一失败信息 20s 内不重复播放（防 reconnect 重发/重建误报） */
+    let lastErrorPlayedAt = 0
 
     /** 检查当前会话 goal 相位（投影帧只触发 list notifier，因此 onList 与 onSession 都会调）。 */
     const checkGoal = (source: string): void => {
@@ -285,30 +440,46 @@ export function apply(ctx: ClientCtx): void {
         lastGoalPhase = goal.phase
       } else if (goal.phase !== lastGoalPhase) {
         dbg('goal phase transition', `${source}: ${lastGoalPhase} -> ${goal.phase}`)
-        if (goal.phase === 'complete') play(VICTORY, settings.volume, 'goal-complete')
+        if (goal.phase === 'complete') playEvent('goal', settings.volume, 'goal-complete')
         lastGoalPhase = goal.phase
       }
     }
 
     const onSession = (): void => {
       if (currentSession === undefined) return
+      const snap = currentSession.getSnapshot()
       // 兜底完成信号：回合数增长 → 延迟复检运行态
-      const size = currentSession.getSnapshot().turnEnds?.size ?? 0
+      const size = snap.turnEnds?.size ?? 0
       if (size > lastTurnEnds) {
         lastTurnEnds = size
         dbg('turnEnds grew', String(size))
         scheduleRunEndCheck()
       }
+      // 任务失败边缘：lastAgentError null → 字符串（host/agent-error 帧）
+      const err = snap.lastAgentError
+      if (typeof err === 'string' && err !== lastError) {
+        lastError = err
+        const now = Date.now()
+        if (now - lastErrorPlayedAt >= 20000) {
+          lastErrorPlayedAt = now
+          const settings = loadSettings()
+          if (settings.enabled && settings.error) playEvent('error', settings.volume, 'agent-error')
+          else dbg('agent-error suppressed (disabled)', err.slice(0, 80))
+        } else {
+          dbg('agent-error dedup window', err.slice(0, 80))
+        }
+      } else if (err === null && lastError !== null) {
+        lastError = null
+      }
       checkGoal('session')
     }
 
     const scheduleRunEndCheck = (): void => {
-      const settings = loadSettings()
       later(() => {
         const now = currentSession === undefined ? undefined : sessions.list.getSnapshot().byId[currentSession.sessionId]
         if (now !== undefined && now.running !== true) {
           const s = loadSettings()
-          if (s.enabled && s.done) play(DONE, s.volume, 'run-end')
+          if (s.enabled && s.done) playEvent('done', s.volume, 'run-end')
         } else {
           dbg('run-end recheck skipped (still running)', now?.running)
         }
@@ -332,7 +503,7 @@ export function apply(ctx: ClientCtx): void {
             seenInteraction.set(id, pending)
             dbg('pendingInteraction', `${id}: ${pending}`)
             if (settings.enabled && settings.approval) {
-              play(pending === 'approval' ? ATTENTION_APPROVAL : ATTENTION_QUESTION, settings.volume, `pending:${pending}`)
+              playEvent(pending === 'approval' ? 'approval' : 'question', settings.volume, `pending:${pending}`)
             }
           }
         } else if (seenInteraction.has(id)) {
@@ -344,7 +515,7 @@ export function apply(ctx: ClientCtx): void {
         if (entry.completed === true && !completedNotified.has(id)) {
           completedNotified.add(id)
           dbg('session completed flag', id)
-          if (settings.enabled && settings.done) play(DONE, settings.volume, 'session-completed')
+          if (settings.enabled && settings.done) playEvent('done', settings.volume, 'session-completed')
         }
 
         // ③ 运行停止：延迟复检（排队间隙 running 短暂为 false 时不误报）
@@ -359,7 +530,7 @@ export function apply(ctx: ClientCtx): void {
               const now = sessions.list.getSnapshot().byId[sid]
               if (now !== undefined && now.running !== true) {
                 const s = loadSettings()
-                if (s.enabled && s.done) play(DONE, s.volume, 'run-end:' + sid)
+                if (s.enabled && s.done) playEvent('done', s.volume, 'run-end:' + sid)
               }
             }, 2500)
           }
@@ -376,11 +547,14 @@ export function apply(ctx: ClientCtx): void {
         currentSession = nextId === undefined ? undefined : sessions.binding(nextId)?.session
         if (currentSession !== undefined) {
           dbg('bound current session', currentSession.sessionId)
+          const snap = currentSession.getSnapshot()
           const projection = currentSession.projections?.get('goal')
           const goal = projection?.goal
           lastGoalId = goal?.id
           lastGoalPhase = goal?.phase
-          lastTurnEnds = currentSession.getSnapshot().turnEnds?.size ?? 0
+          lastTurnEnds = snap.turnEnds?.size ?? 0
+          // 初始化为当前值：页面加载后历史错误不算"新失败"
+          lastError = typeof snap.lastAgentError === 'string' ? snap.lastAgentError : null
           unsubSession = currentSession.subscribe(onSession)
         } else {
           dbg('current session bind failed', nextId)
@@ -430,6 +604,100 @@ export function apply(ctx: ClientCtx): void {
 
 // ── 设置行（设置 → 通用 → 声音提示）───────────────────────────────────────────
 
+const EVENT_ROWS: Array<{ key: SoundEvent; label: string }> = [
+  { key: 'approval', label: '需要授权' },
+  { key: 'question', label: '需要提问' },
+  { key: 'done', label: '任务完成' },
+  { key: 'error', label: '任务失败' },
+  { key: 'goal', label: 'Goal 完成' },
+]
+
+const BTN_STYLE: Record<string, string> = {
+  fontSize: '12px',
+  padding: '2px 10px',
+  borderRadius: '6px',
+  border: '1px solid var(--dsw-alias-border-l2, #ccc)',
+  background: 'var(--dsw-specific-tip, transparent)',
+  color: 'var(--dsw-alias-label-primary, inherit)',
+  cursor: 'pointer',
+}
+
+function EventRow(props: { event: SoundEvent; label: string; settings: SoundSettings; update: (patch: Partial<SoundSettings>) => void }): unknown {
+  const { event, label, settings, update } = props
+  const fileInput = useRef<HTMLInputElement>(null)
+  const custom = settings.custom[event]
+  const disabled = !settings.enabled
+
+  const onFile = (e: { target: { files?: FileList | null } }): void => {
+    const file = e.target.files?.[0]
+    if (file === undefined || file === null) return
+    if (file.size > MAX_CUSTOM_BYTES) {
+      window.alert('音频文件不能超过 10MB')
+      return
+    }
+    const reader = new FileReader()
+    reader.onload = () => {
+      const dataUrl = String(reader.result ?? '')
+      if (dataUrl.length === 0) return
+      // IDB 以固定 key 存本体（文件名会变，key 稳定）
+      void idbSet('custom:' + event, { name: file.name, dataUrl })
+        .then(() => {
+          update({ custom: { ...settings.custom, [event]: { source: 'file', name: file.name } } })
+          dbg('custom sound saved', `${event}: ${file.name} (${file.size}B)`)
+        })
+        .catch((err) => dbg('custom save failed', String(err)))
+    }
+    reader.onerror = () => dbg('custom read failed', file.name)
+    reader.readAsDataURL(file)
+    // 允许连续选择同一文件
+    e.target.value = ''
+  }
+
+  const clearCustom = (): void => {
+    const next = { ...settings.custom }
+    delete next[event]
+    update({ custom: next })
+    void idbDel('custom:' + event).catch((err) => dbg('custom delete failed', String(err)))
+    dbg('custom sound cleared', event)
+  }
+
+  return createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 6, padding: '2px 4px' } },
+    createElement('span', { key: 'label', style: { width: 68, flex: 'none', fontSize: 12, color: 'var(--dsw-alias-label-secondary, #888)' } }, label),
+    createElement('button', {
+      key: 'upload',
+      type: 'button',
+      disabled,
+      onClick: () => fileInput.current?.click(),
+      style: BTN_STYLE,
+    }, '上传'),
+    createElement('input', {
+      key: 'file',
+      ref: fileInput,
+      type: 'file',
+      accept: 'audio/*,.mp3,.wav,.ogg,.m4a,.flac',
+      style: { display: 'none' },
+      onChange: onFile,
+    }),
+    createElement('button', {
+      key: 'preview',
+      type: 'button',
+      disabled,
+      onClick: () => {
+        const s = loadSettings()
+        if (!s.enabled) return
+        playEvent(event, s.volume, 'preview:' + event)
+      },
+      style: BTN_STYLE,
+    }, '试听'),
+    custom !== undefined
+      ? createElement('button', { key: 'clear', type: 'button', onClick: clearCustom, style: BTN_STYLE }, '清除')
+      : null,
+    custom !== undefined
+      ? createElement('span', { key: 'custom-name', style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, #999)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 150 } }, custom.name)
+      : null,
+  )
+}
+
 function SoundSettingsRow(): unknown {
   const [settings, setSettings] = useState(loadSettings)
   const update = (patch: Partial<SoundSettings>): void => {
@@ -437,24 +705,33 @@ function SoundSettingsRow(): unknown {
     setSettings(next)
     saveSettings(next)
   }
-  return createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 10, padding: '6px 0' } },
-    createElement('span', { key: 'label', style: { flex: 1, fontSize: 13 } }, '声音提示 (Sound Alerts)'),
-    createElement('input', {
-      key: 'toggle',
-      type: 'checkbox',
-      checked: settings.enabled,
-      onChange: (e: { target: { checked: boolean } }) => update({ enabled: e.target.checked }),
-    }),
-    createElement('input', {
-      key: 'volume',
-      type: 'range',
-      min: 0,
-      max: 1,
-      step: 0.05,
-      value: settings.volume,
-      disabled: !settings.enabled,
-      onChange: (e: { target: { value: string } }) => update({ volume: Number(e.target.value) }),
-      style: { width: 120 },
-    }),
+  return createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 4, padding: '6px 0' } },
+    createElement('div', { key: 'row1', style: { display: 'flex', alignItems: 'center', gap: 10 } },
+      createElement('span', { key: 'label', style: { flex: 1, fontSize: 13 } }, '声音提示 (Sound Alerts)'),
+      createElement('input', {
+        key: 'toggle',
+        type: 'checkbox',
+        checked: settings.enabled,
+        onChange: (e: { target: { checked: boolean } }) => update({ enabled: e.target.checked }),
+      }),
+      createElement('input', {
+        key: 'volume',
+        type: 'range',
+        min: 0,
+        max: 1,
+        step: 0.05,
+        value: settings.volume,
+        disabled: !settings.enabled,
+        onChange: (e: { target: { value: string } }) => update({ volume: Number(e.target.value) }),
+        style: { width: 120 },
+      }),
+    ),
+    ...EVENT_ROWS.map((row) => createElement(EventRow, {
+      key: row.key,
+      event: row.key,
+      label: row.label,
+      settings,
+      update,
+    })),
   )
 }
