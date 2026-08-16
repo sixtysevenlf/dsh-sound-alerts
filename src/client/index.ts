@@ -354,6 +354,7 @@ interface ListSnapshot {
     running?: boolean
     completed?: boolean
     pendingInteraction?: string
+    projectionValues?: { goal?: { goal?: { phase?: string } } }
   }>
   current?: string
 }
@@ -376,6 +377,7 @@ interface SessionsService {
 type ClientCtx = {
   effect(fn: () => (() => void) | void, name?: string): void
   get(name: string): unknown
+  on(event: string, callback: (...args: unknown[]) => void): void
 }
 
 export function apply(ctx: ClientCtx): void {
@@ -424,6 +426,35 @@ export function apply(ctx: ClientCtx): void {
     let lastError: string | null = null
     /** 失败音时间窗：同一失败信息 20s 内不重复播放（防 reconnect 重发/重建误报） */
     let lastErrorPlayedAt = 0
+    /** 完成音防重：同会话 3s 内最多一声（completed 标记 + run-end 复检叠加时只响一次） */
+    const lastDoneAt = new Map<string, number>()
+
+    /** 连接重置（首次连接/重连）：running 记忆作废，下次 onList 重新基线，避免重连误报边缘。 */
+    ctx.on('connection/reset', () => {
+      runningStates.clear()
+      dbg('connection reset: running baseline cleared')
+    })
+
+    /**
+     * 完成音统一出口：goal 还在自动续跑时抑制（不算"任务完成"，goal 完成另有四音）；
+     * 同会话 3s 防重。
+     */
+    const maybePlayDone = (sessionId: string, reason: string, settings: SoundSettings): void => {
+      const entry = sessions.list.getSnapshot().byId[sessionId]
+      const goalPhase = entry?.projectionValues?.goal?.goal?.phase
+      if (goalPhase === 'active') {
+        dbg('done suppressed (active goal)', `${sessionId} reason=${reason}`)
+        return
+      }
+      const now = Date.now()
+      const last = lastDoneAt.get(sessionId) ?? 0
+      if (now - last < 3000) {
+        dbg('done dedup (3s)', `${sessionId} reason=${reason}`)
+        return
+      }
+      lastDoneAt.set(sessionId, now)
+      playEvent('done', settings.volume, reason)
+    }
 
     /** 检查当前会话 goal 相位（投影帧只触发 list notifier，因此 onList 与 onSession 都会调）。 */
     const checkGoal = (source: string): void => {
@@ -492,7 +523,7 @@ export function apply(ctx: ClientCtx): void {
         const now = sessions.list.getSnapshot().byId[sessionId]
         if (now !== undefined && now.running !== true) {
           const s = loadSettings()
-          if (s.enabled && s.done) playEvent('done', s.volume, 'run-end:' + sessionId)
+          if (s.enabled && s.done) maybePlayDone(sessionId, 'run-end:' + sessionId, s)
         } else {
           dbg('run-end recheck skipped (still running)', now?.running)
         }
@@ -541,7 +572,7 @@ export function apply(ctx: ClientCtx): void {
         if (entry.completed === true && !completedNotified.has(id)) {
           completedNotified.add(id)
           dbg('session completed flag', id)
-          if (settings.enabled && settings.done) playEvent('done', settings.volume, 'session-completed')
+          if (settings.enabled && settings.done) maybePlayDone(id, 'session-completed', settings)
         }
 
         // ③ 运行停止：延迟复检（排队间隙 running 短暂为 false 时不误报）
