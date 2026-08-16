@@ -1,0 +1,7 @@
+# @dsh-external/dsh-sound-alerts bundle patch。
+# 向 Web 装配树插入浏览器名录行：该行进入 Loader 后，dsh-client-modules 的
+# node half 扫描到 dsh.client 声明，将本包 lib/client.js 编入
+# window.__DSH_BOOT__ 浏览器启动图（/plugins/<id>/client.js 由模块宿主提供）。
+- insert:
+    - id: sound-alerts
+      name: '@dsh-external/dsh-sound-alerts'
