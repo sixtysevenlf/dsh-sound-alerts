@@ -409,6 +409,8 @@ export function apply(ctx: ClientCtx): void {
     const seenInteraction = new Map<string, string>()
     const completedNotified = new Set<string>()
     const runningStates = new Map<string, boolean>()
+    /** 首帧基线已建立（页面加载时已存在的 completed 不算新完成） */
+    let baselineCompleted = false
 
     let currentId: string | undefined
     let currentSession: SessionLike | undefined
@@ -416,6 +418,8 @@ export function apply(ctx: ClientCtx): void {
     let lastGoalId: string | undefined
     let lastGoalPhase: string | undefined
     let lastTurnEnds = 0
+    /** turnEnds 检测武装标志：绑定会话后延迟启用，等历史窗口加载完，避免打开旧会话误报 */
+    let turnEndsArmed = false
     /** 最近观察到的 lastAgentError（快照引用/字符串），用于失败边缘检测 */
     let lastError: string | null = null
     /** 失败音时间窗：同一失败信息 20s 内不重复播放（防 reconnect 重发/重建误报） */
@@ -448,12 +452,16 @@ export function apply(ctx: ClientCtx): void {
     const onSession = (): void => {
       if (currentSession === undefined) return
       const snap = currentSession.getSnapshot()
-      // 兜底完成信号：回合数增长 → 延迟复检运行态
-      const size = snap.turnEnds?.size ?? 0
-      if (size > lastTurnEnds) {
-        lastTurnEnds = size
-        dbg('turnEnds grew', String(size))
-        scheduleRunEndCheck()
+      // 兜底完成信号：回合数增长 → 延迟复检运行态。
+      // 仅武装后检测：绑定会话后等历史窗口加载完再启用，避免打开旧会话时
+      // turnEnds 从 0 涨到真实值被误判为"新回合完成"。
+      if (turnEndsArmed) {
+        const size = snap.turnEnds?.size ?? 0
+        if (size > lastTurnEnds) {
+          lastTurnEnds = size
+          dbg('turnEnds grew', String(size))
+          scheduleRunEndCheck(currentSession.sessionId)
+        }
       }
       // 任务失败边缘：lastAgentError null → 字符串（host/agent-error 帧）
       const err = snap.lastAgentError
@@ -474,12 +482,17 @@ export function apply(ctx: ClientCtx): void {
       checkGoal('session')
     }
 
-    const scheduleRunEndCheck = (): void => {
+    /**
+     * 延迟复检"运行已停止"后播完成音。
+     * @param sessionId - 触发时的会话（锁定），避免 2.5s 后用户已切换会话时
+     *   误读新当前会话（点开旧会话时残留复检误报的来源）。
+     */
+    const scheduleRunEndCheck = (sessionId: string): void => {
       later(() => {
-        const now = currentSession === undefined ? undefined : sessions.list.getSnapshot().byId[currentSession.sessionId]
+        const now = sessions.list.getSnapshot().byId[sessionId]
         if (now !== undefined && now.running !== true) {
           const s = loadSettings()
-          if (s.enabled && s.done) playEvent('done', s.volume, 'run-end')
+          if (s.enabled && s.done) playEvent('done', s.volume, 'run-end:' + sessionId)
         } else {
           dbg('run-end recheck skipped (still running)', now?.running)
         }
@@ -490,6 +503,19 @@ export function apply(ctx: ClientCtx): void {
       const snapshot = sessions.list.getSnapshot()
       const settings = loadSettings()
       dbg('onList', { ids: snapshot.ids.length, current: snapshot.current ?? null })
+
+      // 首帧基线：页面加载/重连时已存在的 completed 标记是历史事实，不算"新完成"，
+      // 只对之后新出现的 completed 响（否则刷新页面或重连后"没动也会响"）。
+      if (!baselineCompleted) {
+        baselineCompleted = true
+        for (const id of snapshot.ids) {
+          const e = snapshot.byId[id]
+          if (e !== undefined && e.completed === true) {
+            completedNotified.add(id)
+            dbg('completed baseline', id)
+          }
+        }
+      }
 
       for (const id of snapshot.ids) {
         const entry = snapshot.byId[id]
@@ -523,17 +549,7 @@ export function apply(ctx: ClientCtx): void {
         const isRunning = entry.running === true
         if (wasRunning === true && !isRunning) {
           dbg('running edge true->false', id)
-          if (id === currentSession?.sessionId) scheduleRunEndCheck()
-          else {
-            const sid = id
-            later(() => {
-              const now = sessions.list.getSnapshot().byId[sid]
-              if (now !== undefined && now.running !== true) {
-                const s = loadSettings()
-                if (s.enabled && s.done) playEvent('done', s.volume, 'run-end:' + sid)
-              }
-            }, 2500)
-          }
+          scheduleRunEndCheck(id)
         }
         runningStates.set(id, isRunning)
       }
@@ -552,9 +568,20 @@ export function apply(ctx: ClientCtx): void {
           const goal = projection?.goal
           lastGoalId = goal?.id
           lastGoalPhase = goal?.phase
-          lastTurnEnds = snap.turnEnds?.size ?? 0
           // 初始化为当前值：页面加载后历史错误不算"新失败"
           lastError = typeof snap.lastAgentError === 'string' ? snap.lastAgentError : null
+          // turnEnds 检测延迟武装：历史窗口异步加载（打开旧会话时 turnEnds 会从
+          // 0/小值涨到真实值），等窗口稳定后再以当时值为基线启用，避免误报完成音。
+          lastTurnEnds = snap.turnEnds?.size ?? 0
+          turnEndsArmed = false
+          const boundId = nextId
+          later(() => {
+            if (currentId !== boundId) return // 已切换会话，丢弃
+            const snap2 = currentSession?.getSnapshot()
+            lastTurnEnds = snap2?.turnEnds?.size ?? 0
+            turnEndsArmed = true
+            dbg('turnEnds armed', String(lastTurnEnds))
+          }, 6000)
           unsubSession = currentSession.subscribe(onSession)
         } else {
           dbg('current session bind failed', nextId)
